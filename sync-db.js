@@ -166,11 +166,12 @@ async function bootstrap(since) {
   const cursor = Number.isInteger(since) && since >= 0 ? since : 0;
   if (supabase) {
     try {
-      const { data, error } = await supabase.from('sync_operation_log').select('sequence, op_id, operation_type, record, actor, created_at').gt('sequence', cursor).order('sequence', { ascending: true }).limit(501);
+      const { data, error } = await supabase.from('sync_operation_log').select('sequence, op_id, type, record, actor, created_at').gt('sequence', cursor).order('sequence', { ascending: true }).limit(501);
       if (error) throw error;
       const rows = data || [];
-      const operations = rows.slice(0, 500).map((row) => ({ sequence: row.sequence, opId: row.op_id, type: row.operation_type, record: mapSupabaseRecord(row.record), actor: row.actor, acceptedAt: row.created_at }));
-      const serverSequence = rows.length ? rows[rows.length - 1].sequence : cursor;
+      const operations = rows.slice(0, 500).map((row) => ({ sequence: row.sequence, opId: row.op_id, type: row.type, record: mapSupabaseRecord(row.record), actor: row.actor, acceptedAt: row.created_at }));
+      // يجب أن تكون العلامة آخر عملية أُعيدت فعلياً، لا العملية الإضافية التي استُخدمت فقط لاكتشاف الصفحة التالية.
+      const serverSequence = operations.length ? operations[operations.length - 1].sequence : cursor;
       _healthy = true;
       _lastError = null;
       return { operations, serverSequence, hasMore: rows.length > 500, backend: 'supabase' };
@@ -187,7 +188,10 @@ async function bootstrap(since) {
   }
   const fallback = readFallback();
   const operations = fallback.operations.filter((operation) => operation.sequence > cursor).slice(0, 500);
-  return { operations: copy(operations), serverSequence: fallback.sequence, hasMore: fallback.operations.some((operation) => operation.sequence > (operations.at(-1)?.sequence || cursor)), backend: 'fallback' };
+  const hasMore = fallback.operations.some((operation) => operation.sequence > (operations.at(-1)?.sequence || cursor));
+  // عند وجود صفحة تالية نعيد آخر عنصر مرئي، وإلا يمكن تقديم علامة الخادم الكاملة.
+  const serverSequence = hasMore ? (operations.at(-1)?.sequence || cursor) : fallback.sequence;
+  return { operations: copy(operations), serverSequence, hasMore, backend: 'fallback' };
 }
 
 function status() {

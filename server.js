@@ -9,7 +9,6 @@ const http = require('http');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const basicAuth = require('express-basic-auth');
-const { Server } = require('socket.io');
 const db = require('./db');
 const syncDb = require('./sync-db');
 
@@ -60,7 +59,6 @@ const STATE_KEYS = [
 // ----- إعداد السيرفر -----
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server);
 
 // Railway (وأي منصة استضافة تعمل خلف Reverse Proxy) تضيف ترويسة X-Forwarded-For
 // لطلبات المستخدمين. express-rate-limit يرفض العمل بدون هذا الإعداد ويرمي خطأ
@@ -73,7 +71,7 @@ app.use(helmet({ contentSecurityPolicy: false }));
 // حماية شاملة من محاولات كسر كلمة المرور (Brute-force): حد أقصى للمحاولات على مستوى IP
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 دقيقة
-  max: 50, // 50 محاولة كحد أقصى لكل IP
+  max: Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX || '200', 10), // قابل للضبط لتفادي حجب المستخدمين خلف شبكة مشتركة
   standardHeaders: true,
   legacyHeaders: false,
   message: { ok: false, error: 'محاولات كثيرة جداً، حاول لاحقاً' }
@@ -90,7 +88,7 @@ app.use(basicAuth({
 // حد إضافي وأصرم لمحاولات كتابة/قراءة الـ API لمنع إغراق السيرفر بطلبات متكررة بعد اجتياز تسجيل الدخول
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  max: Number.parseInt(process.env.API_RATE_LIMIT_MAX || '600', 10),
   standardHeaders: true,
   legacyHeaders: false
 });
@@ -130,8 +128,8 @@ app.post('/api/sync/operations', async (req, res) => {
   try {
     const operations = Array.isArray(req.body?.operations) ? req.body.operations : [];
     if (!operations.length) return res.status(400).json({ ok: false, error: 'مطلوب إرسال عملية مزامنة واحدة على الأقل' });
+    if (operations.length > 100) return res.status(413).json({ ok: false, error: 'الحد الأقصى لكل دفعة هو 100 عملية مزامنة' });
     const result = await syncDb.applyOperations(operations, req.auth?.user || 'server-user');
-    if (result.accepted.length) io.emit('sync:operations', { operations: result.accepted, serverSequence: result.serverSequence });
     res.json({ results: result.results, serverSequence: result.serverSequence, backend: result.backend });
   } catch (error) {
     console.error('POST /api/sync/operations error:', error);
@@ -192,10 +190,6 @@ app.get('/api/download/:token', (req, res) => {
   res.setHeader('Content-Length', buf.length);
   res.send(buf);
   _tempFiles.delete(req.params.token);
-});
-
-io.on('connection', (socket) => {
-  socket.on('disconnect', () => {});
 });
 
 // ----- ترحيل بيانات لمرة واحدة (اختياري) — راجع migrate-persons-fix.js -----

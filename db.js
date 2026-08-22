@@ -13,7 +13,7 @@ const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const { notifyAdmin } = require('./notify');
 
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOCAL_FILE = path.join(DATA_DIR, 'state.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(LOCAL_FILE)) fs.writeFileSync(LOCAL_FILE, '{}', 'utf8');
