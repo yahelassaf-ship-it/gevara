@@ -2,13 +2,7 @@
 // الهدف: تخزين "هيكل" التطبيق (الصفحة الرئيسية بكل أصولها المضمّنة)
 // محلياً عبر Cache Storage API (لا حدود حجم منخفضة كـ localStorage)
 // بحيث يفتح التطبيق فوراً حتى بدون إنترنت.
-// بيانات API ومزامنة Socket.io تبقى دائماً Network-only لأن منطق
-// المزامنة (pending state) موجود بالفعل داخل index.html.
-//
-// ⚠️ ملاحظة مهمة: كل مرة يتغيّر فيها index.html، يجب رفع رقم CACHE_NAME هنا
-// (حتى لو حرفاً واحداً) — المتصفح لا يكتشف تحديثاً لملف الـ Service Worker
-// نفسه إلا إذا تغيّرت محتوياته بايتاً بايت. بدون رفع الرقم هنا، أي نشر جديد
-// لصفحة التطبيق يبقى غير مرئي للمستخدمين رغم نجاح النشر على السيرفر.
+// بيانات API تبقى دائماً Network-only لأن منطق المزامنة الدقيقة يدير طابوره في الواجهة.
 
 const CACHE_NAME = 'diwan-shell-v5';
 const SHELL_URLS = ['/'];
@@ -35,13 +29,6 @@ self.addEventListener('activate', (event) => {
   self.clients.claim();
 });
 
-// يسمح لصفحة التطبيق بطلب تفعيل نسخة الـ Service Worker الجديدة فوراً
-// (بدل انتظار إغلاق كل التبويبات المفتوحة) — راجع الاستماع لـ 'controllerchange'
-// داخل index.html الذي يعيد تحميل الصفحة تلقائياً بعد التفعيل.
-self.addEventListener('message', (event) => {
-  if (event.data === 'SKIP_WAITING') self.skipWaiting();
-});
-
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   let url;
@@ -56,9 +43,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // طلبات API والمزامنة اللحظية (Socket.io): تذهب دائماً للشبكة مباشرة
+  // طلبات API: تذهب دائماً للشبكة مباشرة
   // ولا تُخزَّن أبداً، حتى لا تتعارض مع منطق المزامنة الموجود في الصفحة.
-  if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/socket.io/')) {
+  if (url.pathname.startsWith('/api/')) {
     event.respondWith(
       fetch(req).catch(() =>
         new Response(
@@ -75,29 +62,9 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // صفحة التطبيق نفسها (هيكل HTML): Network-First. أهم تغيير — كنا نعرض
-  // النسخة المخزّنة محلياً فوراً دائماً حتى لو كان هناك اتصال إنترنت سليم
-  // (Stale-While-Revalidate)، مما كان يُخفي أي كود جديد بعد النشر عن
-  // المستخدم لحد ما يعيد فتح التبويب مرتين أو يمسح الكاش يدوياً. الآن:
-  // نحاول الشبكة أولاً دوماً، ولا نستخدم النسخة المخزّنة إلا عند انقطاع
-  // فعلي للاتصال — هذا يحافظ على ميزة العمل بدون نت دون إخفاء التحديثات.
-  if (req.mode === 'navigate' || SHELL_URLS.includes(url.pathname)) {
-    event.respondWith(
-      fetch(req)
-        .then((res) => {
-          if (res && res.status === 200) {
-            const resClone = res.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(req, resClone));
-          }
-          return res;
-        })
-        .catch(() => caches.match(req).then((cached) => cached || caches.match('/')))
-    );
-    return;
-  }
-
-  // باقي الأصول الثابتة (غير صفحة التطبيق نفسها): Stale-While-Revalidate
-  // يبقى مناسباً هنا (سريع، وتُحدَّث بالخلفية دون التأثير على منطق الحفظ).
+  // باقي الطلبات (الصفحة الرئيسية والأصول الثابتة):
+  // Stale-While-Revalidate: نُرجع النسخة المخزّنة فوراً (سريع وعمل بدون نت)
+  // وفي نفس الوقت نحاول التحديث من الشبكة في الخلفية للمرة القادمة.
   event.respondWith(
     caches.match(req).then((cached) => {
       const networkFetch = fetch(req)

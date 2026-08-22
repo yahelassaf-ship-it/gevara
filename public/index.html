@@ -8588,6 +8588,13 @@ async function refreshAppData() {
   if (_refreshingAppData) return;
   _refreshingAppData = true;
   try {
+    // بعد تفعيل sync-v2 تصبح العمليات الدقيقة هي المصدر المعتمد. تحميل /api/state
+    // هنا كان يعيد لقطة قديمة وقد يكتب فوق التحديثات التي وصلت من الأجهزة الأخرى.
+    if (window.Five66Sync && typeof window.Five66Sync.pull === 'function') {
+      await window.Five66Sync.pull();
+      return;
+    }
+    // يبقى هذا المسار لفتح البيانات القديمة قبل أن يُحمّل محرك الترحيل والمزامنة.
     await loadState();
     if (mergeSpecialRegistryRecordsIntoArchive()) saveState();
     sortPersonsInPlace();
@@ -8602,7 +8609,6 @@ async function refreshAppData() {
     try { updateStats(); } catch(e){ console.error('updateStats:', e); }
     try { updateSectionHeaders(); } catch(e){ console.error('updateSectionHeaders:', e); }
     try { refreshNotifications(); } catch(e){ console.error('refreshNotifications:', e); }
-    if (typeof showToast === 'function') showToast('✅ تم تحديث البيانات من مستخدم آخر');
   } catch(e) {
     console.warn('refreshAppData:', e);
   } finally {
@@ -12423,7 +12429,9 @@ function printKhasm() {
 
 // ===================== INJURED / MARTYRS / HARARIN =====================
 function renderInjured() {
-  document.getElementById('injured-body').innerHTML = injured.map((r,i)=>`
+  var body = document.getElementById('injured-body');
+  if (!body) return;
+  body.innerHTML = injured.map((r,i)=>`
     <tr>
       <td>${i+1}</td><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.unit)}</td><td><code>${escapeHtml(r.milId)}</code></td>
       <td style="color:var(--red-danger);font-weight:600">${escapeHtml(r.injuryType)}</td><td>${escapeHtml(r.address)}</td>
@@ -12436,7 +12444,9 @@ function renderInjured() {
 }
 
 function renderMartyrs() {
-  document.getElementById('martyrs-body').innerHTML = martyrs.map((r,i)=>`
+  var body = document.getElementById('martyrs-body');
+  if (!body) return;
+  body.innerHTML = martyrs.map((r,i)=>`
     <tr>
       <td>${i+1}</td><td><code>${escapeHtml(r.milId)}</code></td>
       <td style="font-weight:700">🌹 ${escapeHtml(r.name)}</td><td>${escapeHtml(r.unit)}</td><td>${r.place}</td><td>${r.date}</td><td>${r.notes||'—'}</td>
@@ -12449,7 +12459,9 @@ function renderMartyrs() {
 }
 
 function renderHararin() {
-  document.getElementById('hararin-body').innerHTML = hararin.map((r,i)=>`
+  var body = document.getElementById('hararin-body');
+  if (!body) return;
+  body.innerHTML = hararin.map((r,i)=>`
     <tr>
       <td>${i+1}</td><td>${escapeHtml(r.unit)}</td><td><strong>${escapeHtml(r.name)}</strong></td>
       <td>${escapeHtml(r.nickname)}</td><td><code>${escapeHtml(r.milId)}</code></td><td>${escapeHtml(r.job)}</td><td>${escapeHtml(r.level)}</td>
@@ -13674,70 +13686,63 @@ function updateSectionHeaders() {
   }
 }
 
-// ===================== SAVE/LOAD STATE (نظام العمليات الدقيق - Precise Sync) =====================
-// كل مفتاح من مفاتيح الحالة يُعامَل كسجل مستقل (collection='app_state', recordId=المفتاح)
-// له رقم مراجعة (revision) خاص به، ويُزامَن عبر /api/sync/operations و/api/sync/bootstrap —
-// يطابق هذا نظام سيرفر sync-db.js الجديد (الذي حلّ محل /api/state القديم المُعطَّل الآن عمداً).
-var _SYNC_COLLECTION = 'app_state';
-var _REV_KEY = 'mil_sync_revisions_v2';
-var _SEQ_KEY = 'mil_sync_sequence_v2';
-var _QUEUE_KEY = 'mil_sync_queue_v2'; // خريطة recordId -> {opId, baseRevision, payload} لم تُؤكَّد من السيرفر بعد
-
-function _getRevisions() { try { return JSON.parse(_ls.get(_REV_KEY) || '{}'); } catch(e) { return {}; } }
-function _setRevisions(o) { try { _ls.set(_REV_KEY, JSON.stringify(o)); } catch(e) {} }
-function _getLastSeq() { try { return parseInt(_ls.get(_SEQ_KEY) || '0', 10) || 0; } catch(e) { return 0; } }
-function _setLastSeq(n) { try { _ls.set(_SEQ_KEY, String(n)); } catch(e) {} }
-function _getQueue() { try { return JSON.parse(_ls.get(_QUEUE_KEY) || '{}'); } catch(e) { return {}; } }
-function _setQueue(o) { try { _ls.set(_QUEUE_KEY, JSON.stringify(o)); } catch(e) {} }
-function _newOpId(key) { return key + '_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10); }
+// ===================== SAVE/LOAD STATE =====================
+var _SYNC_PENDING_STATE_KEY = 'mil_sync_pending_state_v1';
+var _SYNC_PENDING_AT_KEY = 'mil_sync_pending_at_v1';
 
 function _buildStateSnapshot() {
   var _state = {};
-  _state.mil_khasm = khasmRows;
-  _state.mil_injured = injured;
-  _state.mil_martyrs = martyrs;
-  _state.mil_hararin = hararin;
-  _state.mil_nextId = nextId;
-  _state.mil_tafaqud_archive = tafaqudArchive;
-  _state.mil_ghiyab_archive = ghiyabArchive;
-  _state.mil_person_events = personEvents;
-  _state.mil_operational_archive = operationalArchiveDocuments;
-  _state.mil_payroll = payrollRecords;
-  _state.mil_payroll_headers = payrollHeaders;
-  _state.mil_payroll_nextId = payrollNextId;
+  _state.mil_khasm = JSON.stringify(khasmRows);
+  _state.mil_injured = JSON.stringify(injured);
+  _state.mil_martyrs = JSON.stringify(martyrs);
+  _state.mil_hararin = JSON.stringify(hararin);
+  _state.mil_nextId = String(nextId);
+  _state.mil_tafaqud_archive = JSON.stringify(tafaqudArchive);
+  _state.mil_ghiyab_archive = JSON.stringify(ghiyabArchive);
+  _state.mil_person_events = JSON.stringify(personEvents);
+  _state.mil_operational_archive = JSON.stringify(operationalArchiveDocuments);
+  _state.mil_payroll = JSON.stringify(payrollRecords);
+  _state.mil_payroll_headers = JSON.stringify(payrollHeaders);
+  _state.mil_payroll_nextId = String(payrollNextId);
   if(typeof _BASE_PERSONS_IDS !== 'undefined' && _BASE_PERSONS_IDS.length) {
     var _baseSet = new Set(_BASE_PERSONS_IDS);
     var _currentIds = new Set(persons.map(function(p){ return p.id; }));
     var addedPersons = persons.filter(function(p){ return !_baseSet.has(p.id); });
     var editedPersons = persons.filter(function(p){ return _baseSet.has(p.id); });
     var deletedPersons = _BASE_PERSONS_IDS.filter(function(id){ return !_currentIds.has(id); });
-    _state.mil_persons_added = addedPersons;
-    _state.mil_persons_edited = editedPersons;
-    _state.mil_persons_deleted = deletedPersons;
+    _state.mil_persons_added = JSON.stringify(addedPersons);
+    _state.mil_persons_edited = JSON.stringify(editedPersons);
+    _state.mil_persons_deleted = JSON.stringify(deletedPersons);
   }
   return _state;
 }
-// نسخة احتياطية محلية فورية (نص JSON، كالسابق) — تضمن ألا يبقى أي جزء آخر من
-// الكود يقرأ _ls مباشرة معطوباً، وتُستخدم أيضاً لإعادة البناء عند إعادة تحميل الصفحة.
-function _persistLocalCache(stateObj) {
-  for (var k in stateObj) { try { _ls.set(k, JSON.stringify(stateObj[k])); } catch(e) {} }
+function _setPendingSyncState(stateObj) {
+  try {
+    _ls.set(_SYNC_PENDING_STATE_KEY, JSON.stringify(stateObj));
+    _ls.set(_SYNC_PENDING_AT_KEY, String(Date.now()));
+  } catch(e) {}
 }
-// يضيف/يحدّث كل مفتاح متغيّر في طابور المزامنة، محتفظاً بنفس opId إن كان
-// هناك تعديل سابق لم يُرسَل بعد (idempotency) — فقط نستبدل الحمولة بالأحدث.
-function _queueStateForSync(stateObj) {
-  var queue = _getQueue();
-  var revisions = _getRevisions();
-  for (var key in stateObj) {
-    var existing = queue[key];
-    queue[key] = {
-      opId: (existing && existing.opId) || _newOpId(key),
-      baseRevision: (existing ? existing.baseRevision : (revisions[key] || 0)),
-      payload: stateObj[key]
-    };
+function _clearPendingSyncState() {
+  try {
+    _ls.remove(_SYNC_PENDING_STATE_KEY);
+    _ls.remove(_SYNC_PENDING_AT_KEY);
+  } catch(e) {}
+}
+function _getPendingSyncState() {
+  try {
+    var raw = _ls.get(_SYNC_PENDING_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch(e) {
+    return null;
   }
-  _setQueue(queue);
 }
-
+function _getPendingSyncAt() {
+  try {
+    return parseInt(_ls.get(_SYNC_PENDING_AT_KEY) || '0', 10) || 0;
+  } catch(e) {
+    return 0;
+  }
+}
 // تجميع الإرسال للسيرفر (debounce): التعديلات السريعة المتتالية (كتابة في حقل،
 // تعديل عدة صفوف، حذف جماعي) كانت كل واحدة منها ترسل طلب POST كامل فوراً —
 // هذا يستهلك حد apiLimiter بسرعة (120 طلب/دقيقة) وقد يسبب رفض طلبات (429) عند
@@ -13762,132 +13767,41 @@ function _ensureSaveIndicator() {
 
 function saveState(immediate) {
   try {
+    // يبقى التخزين المحلي فورياً، بينما sync-v2.js يحوّل الفروق إلى عمليات دقيقة.
+    // لا تُرسل لقطة الحالة الكاملة إطلاقاً لأن POST /api/state أُلغي عمداً.
     var _state = _buildStateSnapshot();
-    _persistLocalCache(_state);
-    _queueStateForSync(_state);
+    for (var _k in _state) _ls.set(_k, _state[_k]);
+    _setPendingSyncState(_state); // توافق مؤقت مع النسخ الأقدم واستعادة محلية فقط.
     var si = _ensureSaveIndicator();
     clearTimeout(_syncDebounceTimer);
-    if (immediate) {
-      si.textContent = '⏳ جارٍ الحفظ فوراً...'; si.style.opacity = '1';
-      flushSyncQueue(si);
-    } else {
-      si.textContent = '⏳ سيُحفظ خلال لحظات...'; si.style.opacity = '1';
-      _syncDebounceTimer = setTimeout(function(){
-        si.textContent='⏳ جارٍ الحفظ...'; si.style.opacity='1';
-        flushSyncQueue(si);
-      }, _SYNC_DEBOUNCE_MS);
-    }
-  } catch(e){ console.warn('saveState:',e); }
+    si.textContent = immediate ? '⏳ حُفظ محلياً وتُرسل التعديلات...' : '⏳ حُفظ محلياً...';
+    si.style.opacity = '1';
+    clearTimeout(window._siT);
+    window._siT = setTimeout(function () { si.style.opacity = '0'; }, immediate ? 2200 : 1200);
+  } catch (e) { console.warn('saveState:', e); }
 }
-// إرسال فوري بدون انتظار الـ debounce — يُستخدم عند مغادرة الصفحة/إخفائها
-// حتى لا يبقى تعديل معلّق في الذاكرة فقط دون إرسال.
+
+// عند مغادرة الصفحة، يرفع محرك العمليات الدفعة الموجودة فقط؛ ولا يوجد إرسال قديم للّقطة الكاملة.
 function _forceFlushNow() {
   clearTimeout(_syncDebounceTimer);
-  if (Object.keys(_getQueue()).length) flushSyncQueue(_ensureSaveIndicator());
+  if (window.Five66Sync && typeof window.Five66Sync.flush === 'function') {
+    window.Five66Sync.flush().catch(function () {});
+  }
 }
-document.addEventListener('visibilitychange', function(){ if(document.hidden) _forceFlushNow(); });
+document.addEventListener('visibilitychange', function () { if (document.hidden) _forceFlushNow(); });
 window.addEventListener('pagehide', _forceFlushNow);
 window.addEventListener('beforeunload', _forceFlushNow);
 
-// ===================== مزامنة مع السيرفر (نظام العمليات الدقيق) =====================
-var _SYNC_OPS_URL = location.origin + '/api/sync/operations';
-var _SYNC_BOOTSTRAP_URL = location.origin + '/api/sync/bootstrap';
-
-var _flushInProgress = false;
-function flushSyncQueue(indicatorEl) {
-  if (_flushInProgress) return Promise.resolve(false);
-  var queue = _getQueue();
-  var keys = Object.keys(queue);
-  if (!keys.length) return Promise.resolve(true);
-  _flushInProgress = true;
-  var opIdToKey = {};
-  var operations = keys.map(function(key){
-    opIdToKey[queue[key].opId] = key;
-    return {
-      opId: queue[key].opId,
-      collection: _SYNC_COLLECTION,
-      recordId: key,
-      type: 'upsert',
-      baseRevision: queue[key].baseRevision,
-      payload: queue[key].payload
-    };
-  });
-  return fetch(_SYNC_OPS_URL, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ operations: operations })
-  }).then(function(r){
-    if(!r.ok) throw new Error('http '+r.status);
-    return r.json();
-  }).then(function(data){
-    var results = data.results || [];
-    var revisions = _getRevisions();
-    var queueNow = _getQueue();
-    var hadConflict = false;
-    results.forEach(function(res){
-      if (!res) return;
-      var key = (res.record && res.record.id) || opIdToKey[res.opId];
-      if (!key) return;
-      if (res.status === 'accepted') {
-        if (res.record) revisions[key] = res.record.revision;
-        if (queueNow[key] && queueNow[key].opId === res.opId) delete queueNow[key];
-      } else if (res.status === 'conflict') {
-        // عدّل جهاز آخر نفس المفتاح قبلنا. نتبنّى رقم المراجعة الحقيقي من السيرفر
-        // حتى تُقبل المحاولة القادمة، مع إبقاء تعديلنا المحلي في الطابور لإعادة
-        // إرساله بمراجعة صحيحة (نفس مبدأ "آخر تعديل يفوز" الذي كان معتمداً في
-        // النظام القديم أصلاً، لكن الآن مع وعي بالتعارض بدل تجاهله بصمت).
-        hadConflict = true;
-        if (res.record) {
-          revisions[key] = res.record.revision;
-          if (queueNow[key]) {
-            queueNow[key].baseRevision = res.record.revision;
-            queueNow[key].opId = _newOpId(key);
-          }
-        }
-      } else if (res.status === 'invalid') {
-        console.error('عملية مزامنة غير صالحة لـ ' + key + ':', res.message);
-        if (queueNow[key] && queueNow[key].opId === res.opId) delete queueNow[key];
-      }
-    });
-    _setRevisions(revisions);
-    _setQueue(queueNow);
-    if (typeof data.serverSequence === 'number' && data.serverSequence > _getLastSeq()) {
-      _setLastSeq(data.serverSequence);
-    }
-    var remaining = Object.keys(queueNow).length;
-    if (indicatorEl) {
-      if (hadConflict) {
-        indicatorEl.textContent = '⚠ عدّل جهاز آخر نفس القسم — تمت إعادة المحاولة تلقائياً';
-        indicatorEl.style.opacity='1'; indicatorEl.style.background='rgba(90,70,10,.92)'; indicatorEl.style.color='#f5e08a';
-        clearTimeout(window._siT); window._siT=setTimeout(function(){indicatorEl.style.opacity='0';},3200);
-        setTimeout(function(){ flushSyncQueue(indicatorEl); }, 300);
-      } else if (!remaining) {
-        indicatorEl.textContent='✓ محفوظ على السيرفر'; indicatorEl.style.opacity='1'; indicatorEl.style.background='rgba(30,60,20,.92)'; indicatorEl.style.color='#c8f5a0';
-        clearTimeout(window._siT); window._siT=setTimeout(function(){indicatorEl.style.opacity='0';},1800);
-      }
-    }
-    _flushInProgress = false;
-    return !hadConflict;
-  }).catch(function(e){
-    console.warn('flushSyncQueue:', e);
-    _flushInProgress = false;
-    if(indicatorEl){
-      indicatorEl.textContent='⚠ تعذر الاتصال — سيُعاد الحفظ تلقائياً'; indicatorEl.style.opacity='1'; indicatorEl.style.background='rgba(90,20,20,.92)'; indicatorEl.style.color='#f5c0c0';
-      clearTimeout(window._siT); window._siT=setTimeout(function(){indicatorEl.style.opacity='0';},3200);
-    }
-    return false;
-  });
+// ===================== توافق المزامنة =====================
+// تُستدعى هذه الدوال من إضافات قديمة في الصفحة. الحفظ الفعلي مسؤولية sync-v2.js.
+var _SYNC_URL = window.SERVER_SYNC_URL || (location.origin + '/api/state');
+function syncStateToServer() {
+  if (window.Five66Sync && typeof window.Five66Sync.flush === 'function') return window.Five66Sync.flush();
+  return Promise.resolve(false);
 }
-function flushPendingSync(indicatorEl) {
-  return flushSyncQueue(indicatorEl);
+function flushPendingSync() {
+  return syncStateToServer();
 }
-// إعادة محاولة دورية للتعديلات المعلّقة — يضمن ألا يبقى أي تعديل بدون رفع للسيرفر
-// حتى لو فشل الإرسال بصمت (انقطاع شبكة مؤقت) دون أن يتفاعل المستخدم بعدها.
-setInterval(function(){
-  if (navigator.onLine && Object.keys(_getQueue()).length) {
-    flushSyncQueue(_ensureSaveIndicator());
-  }
-}, 4000);
 // ===================== تحميل صور الأشخاص (ملف منفصل) =====================
 // الصور مفصولة عن persons في ملف persons-photos.json لتقليل حجم الصفحة الرئيسية.
 // إن أردت لاحقاً نقل الملف إلى سيرفر، غيّر PERSON_PHOTOS_URL إلى رابط كامل
@@ -13926,97 +13840,80 @@ async function loadShamCashPhotos() {
   }
 }
 
-// يجلب كل عمليات المزامنة الجديدة منذ آخر رقم تسلسل معروف محلياً، صفحة تلو
-// الأخرى (السيرفر يحدّ كل استجابة بـ 500 عملية)، ويحتفظ بآخر عملية لكل مفتاح فقط
-// (وهي ما يهمنا لإعادة بناء الحالة الحالية).
-async function _bootstrapAll(sinceCursor) {
-  var cursor = sinceCursor || 0;
-  var latestByKey = {};
-  var guard = 0;
-  while (guard < 100) {
-    guard++;
-    var r = await fetch(_SYNC_BOOTSTRAP_URL + '?since=' + cursor, {cache:'no-store'});
-    if (!r.ok) break;
-    var data = await r.json();
-    var ops = data.operations || [];
-    ops.forEach(function(op){ if (op.record && op.record.id) latestByKey[op.record.id] = op; });
-    if (typeof data.serverSequence === 'number') cursor = data.serverSequence;
-    if (!data.hasMore) break;
-  }
-  return { latestByKey: latestByKey, serverSequence: cursor };
-}
-
 async function loadState() {
+  var serverState = null;
+  var pendingState = _getPendingSyncState();
   try {
-    var boot = await _bootstrapAll(_getLastSeq());
-    var revisions = _getRevisions();
-    for (var key in boot.latestByKey) {
-      var rec = boot.latestByKey[key].record;
-      if (!rec) continue;
-      revisions[key] = rec.revision;
-      try { _ls.set(key, JSON.stringify(rec.payload)); } catch(e) {}
+    var r = await fetch(_SYNC_URL, {cache:'no-store'});
+    if(r.ok) {
+      serverState = await r.json();
     }
-    _setRevisions(revisions);
-    _setLastSeq(boot.serverSequence);
-  } catch(e){ console.warn('loadState bootstrap:', e); }
+  } catch(e){ console.warn('loadState fetch:', e); }
 
-  // أي تعديلات محلية لم تُرفع بعد للسيرفر (بسبب انقطاع سابق) تبقى لها الأولوية
-  // على ما وصل للتو من السيرفر لنفس المفتاح، حتى لا تُفقد.
-  var queue = _getQueue();
-  for (var qk in queue) { try { _ls.set(qk, JSON.stringify(queue[qk].payload)); } catch(e) {} }
+  var effectiveState = serverState || {};
+  var serverUpdatedAt = serverState && serverState._updatedAt ? Date.parse(serverState._updatedAt) || 0 : 0;
+  var pendingAt = _getPendingSyncAt();
+  if(pendingState && (!serverUpdatedAt || pendingAt >= serverUpdatedAt)) {
+    effectiveState = Object.assign({}, serverState || {}, pendingState);
+  } else if(pendingState && serverUpdatedAt && pendingAt < serverUpdatedAt) {
+    _clearPendingSyncState();
+    pendingState = null;
+  }
+  for(var sk in effectiveState){ if(effectiveState[sk]!=null) _ls.set(sk, effectiveState[sk]); }
 
+  function _get(key){ return (effectiveState && effectiveState[key]!=null) ? effectiveState[key] : _ls.get(key); }
   // البيانات الأساسية محقونة مباشرة في الكود — السيرفر/التخزين المحلي للتعديلات فقط
   try {
-    const k = _ls.get('mil_khasm');
+    const k = _get('mil_khasm');
     if(k) khasmRows = JSON.parse(k);
 
-    var deletedP = _ls.get('mil_persons_deleted');
+    var deletedP = _get('mil_persons_deleted');
     if(deletedP) {
       var deletedIds = JSON.parse(deletedP);
       var deletedSet = new Set(deletedIds);
       persons = persons.filter(function(p){ return !deletedSet.has(p.id); });
     }
 
-    var editedP = _ls.get('mil_persons_edited');
+    var editedP = _get('mil_persons_edited');
     if(editedP) {
       var edits = JSON.parse(editedP);
       edits.forEach(function(e){ var idx=persons.findIndex(function(x){return x.id===e.id;}); if(idx>-1) persons[idx]=e; });
     }
 
-    var addedP = _ls.get('mil_persons_added');
+    var addedP = _get('mil_persons_added');
     if(addedP) {
       var arr = JSON.parse(addedP);
       arr.forEach(function(p){ if(!persons.find(function(x){return x.id===p.id;})) persons.push(p); });
     }
 
-    const inj = _ls.get('mil_injured');
+    const inj = _get('mil_injured');
     if(inj) injured = JSON.parse(inj);
-    const m = _ls.get('mil_martyrs');
+    const m = _get('mil_martyrs');
     if(m) martyrs = JSON.parse(m);
-    const h = _ls.get('mil_hararin');
+    const h = _get('mil_hararin');
     if(h) hararin = JSON.parse(h);
-    const n = _ls.get('mil_nextId');
+    const n = _get('mil_nextId');
     if(n) nextId = parseInt(n);
 
-    const tfa = _ls.get('mil_tafaqud_archive');
+    const tfa = _get('mil_tafaqud_archive');
     if(tfa) tafaqudArchive = JSON.parse(tfa);
-    const gha = _ls.get('mil_ghiyab_archive');
+    const gha = _get('mil_ghiyab_archive');
     if(gha) ghiyabArchive = JSON.parse(gha);
-    const pev = _ls.get('mil_person_events');
+    const pev = _get('mil_person_events');
     if(pev) personEvents = JSON.parse(pev);
-    const oar = _ls.get('mil_operational_archive');
+    const oar = _get('mil_operational_archive');
     if(oar) operationalArchiveDocuments = JSON.parse(oar);
 
-    const pr = _ls.get('mil_payroll');
+    const pr = _get('mil_payroll');
     if(pr) payrollRecords = JSON.parse(pr);
-    const prh = _ls.get('mil_payroll_headers');
+    const prh = _get('mil_payroll_headers');
     if(prh) payrollHeaders = JSON.parse(prh);
-    const prn = _ls.get('mil_payroll_nextId');
+    const prn = _get('mil_payroll_nextId');
     if(prn) payrollNextId = parseInt(prn) || (payrollRecords.length ? Math.max(...payrollRecords.map(r=>r._id))+1 : 1);
   } catch(e){ console.log('loadState error:',e); }
 
-  if (Object.keys(queue).length) {
-    setTimeout(function(){ flushSyncQueue(_ensureSaveIndicator()); }, 200);
+  if(pendingState) {
+    setTimeout(function(){ flushPendingSync(_ensureSaveIndicator()); }, 200);
   }
 }
 
@@ -14055,38 +13952,7 @@ if('serviceWorker' in navigator) {
   window.addEventListener('load', function() {
     navigator.serviceWorker.register('/service-worker.js').then(function(reg){
       console.log('Service Worker مسجّل بنجاح، النطاق:', reg.scope);
-      // إن وُجد Service Worker جديد بانتظار التفعيل (من نشر سابق قبل تحميل
-      // هذه الصفحة)، فعّله فوراً بدل الانتظار لإغلاق كل التبويبات المفتوحة.
-      if (reg.waiting) reg.waiting.postMessage('SKIP_WAITING');
-      reg.addEventListener('updatefound', function(){
-        var newWorker = reg.installing;
-        if (!newWorker) return;
-        newWorker.addEventListener('statechange', function(){
-          if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-            newWorker.postMessage('SKIP_WAITING');
-          }
-        });
-      });
     }).catch(function(e){ console.warn('فشل تسجيل Service Worker:', e); });
-
-    // عندما تُفعَّل نسخة Service Worker جديدة وتصبح هي المتحكّمة، أعد تحميل
-    // الصفحة مرة واحدة فقط حتى يظهر التحديث الجديد تلقائياً دون تدخل يدوي
-    // (مسح كاش/إغلاق تبويب) من المستخدم في كل مرة يصدر فيها نشر جديد.
-    // نتجنّب المقاطعة إن كان هناك نموذج/بطاقة مفتوحة حالياً (لا نريد فقدان
-    // تعديل غير محفوظ) — نعيد المحاولة كل بضع ثوانٍ لحد ما تُغلَق.
-    var _swReloaded = false;
-    function _reloadForNewVersion(){
-      if (_swReloaded) return;
-      var openModalEl = document.querySelector('.modal-overlay.open');
-      var openDrawerEl = document.querySelector('.drawer.open');
-      if (openModalEl || openDrawerEl) {
-        setTimeout(_reloadForNewVersion, 4000);
-        return;
-      }
-      _swReloaded = true;
-      location.reload();
-    }
-    navigator.serviceWorker.addEventListener('controllerchange', _reloadForNewVersion);
   });
 }
 
@@ -19940,74 +19806,15 @@ function showImportResults(results, fileName, selectedColumn) {
 })();
 </script>
 
-<script src="/socket.io/socket.io.js"></script>
 <script>
-(function(){
+(function () {
   window._clientId = 'c_' + Math.random().toString(36).slice(2) + Date.now();
   window._currentUser = null;
-  // جلب هوية الحساب الحقيقي (من Basic Auth) لعرضه في سجل العمليات والتحديث
-  // الحي بدل معرّف عشوائي مجهول — يفيد خصوصاً بعد دعم عدة حسابات مشرفين.
-  fetch('/api/whoami').then(function(r){ return r.ok ? r.json() : null; }).then(function(info){
-    if(info && info.user) window._currentUser = info.user;
-  }).catch(function(){});
-  try {
-    var socket = io();
-    var _lastRemoteUser = null;
-    // عند (إعادة) الاتصال بالسيرفر عبر Socket.IO، ارفع فوراً أي تعديل معلّق —
-    // يغطي حالات انقطاع الشبكة المؤقت التي لا يلتقطها حدث 'online' في المتصفح دوماً.
-    socket.on('connect', function(){
-      if (typeof flushPendingSync === 'function' && typeof _ensureSaveIndicator === 'function') {
-        flushPendingSync(_ensureSaveIndicator());
-      }
-    });
-    // ملاحظة: السيرفر يبثّ التحديثات عبر الحدث 'sync:operations' (راجع server.js)
-    // وليس 'state-changed' القديم — الاسم القديم لا يُطلَق إطلاقاً من السيرفر الحالي.
-    socket.on('sync:operations', function(data){
-      var ops = (data && data.operations) || [];
-      if (!ops.length) return;
-      _lastRemoteUser = ops[ops.length - 1].actor || null;
-      // إن كان هناك نموذج/بطاقة مفتوحة، لا نمزج تلقائياً حتى لا نفقد تعديلاً غير محفوظ —
-      // نكتفي بشريط تنبيه غير ملزم يتيح للمستخدم اختيار التحديث متى أراد.
-      var openModalEl = document.querySelector('.modal-overlay.open');
-      var openDrawerEl = document.querySelector('.drawer.open');
-      if (openModalEl || openDrawerEl) {
-        showRemoteUpdateBar(_lastRemoteUser);
-        return;
-      }
-      if (window.Five66Sync && typeof window.Five66Sync.pull === 'function') {
-        window.Five66Sync.pull().catch(function(){});
-      } else if (typeof refreshAppData === 'function') {
-        refreshAppData();
-      } else {
-        showRemoteUpdateBar(_lastRemoteUser);
-      }
-    });
-
-    function showRemoteUpdateBar(byUser){
-      var bar = document.getElementById('remote-update-bar');
-      if(!bar){
-        bar = document.createElement('div');
-        bar.id = 'remote-update-bar';
-        bar.style.cssText = 'position:fixed;bottom:0;left:0;right:0;z-index:99999;background:#243318;color:#f5e08a;border-top:2px solid #c8a84b;padding:12px;text-align:center;font-family:Cairo,Tajawal,sans-serif;font-weight:700;cursor:pointer;box-shadow:0 -4px 14px rgba(0,0,0,.4);';
-        bar.onclick = function(){
-          // نغلق أي نافذة/دروار مفتوح كان يمنع الدمج الحي التلقائي (كان يحتوي
-          // تعديلاً غير محفوظ، لذا الإغلاق هنا مقصود ومتوقَّع من ضغطة المستخدم)
-          document.querySelectorAll('.modal-overlay.open').forEach(function(el){ el.classList.remove('open'); });
-          document.querySelectorAll('.drawer.open').forEach(function(el){ el.classList.remove('open'); });
-          bar.remove();
-          if (typeof refreshAppData === 'function') {
-            refreshAppData();
-          } else {
-            location.reload();
-          }
-        };
-        document.body.appendChild(bar);
-      }
-      bar.textContent = byUser
-        ? ('⚠ تم تحديث البيانات بواسطة "' + byUser + '" — اضغط هنا لتحميل آخر التحديثات')
-        : '⚠ تم تحديث البيانات من مستخدم آخر — اضغط هنا لتحميل آخر التحديثات';
-    }
-  } catch(e){ console.warn('socket init:', e); }
+  fetch('/api/whoami').then(function (response) {
+    return response.ok ? response.json() : null;
+  }).then(function (info) {
+    if (info && info.user) window._currentUser = info.user;
+  }).catch(function () {});
 })();
 </script>
 

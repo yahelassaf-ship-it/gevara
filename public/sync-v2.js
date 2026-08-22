@@ -5,7 +5,6 @@
   var QUEUE_KEY = "five66.sync.v2.queue";
   var CURSOR_KEY = "five66.sync.v2.cursor";
   var CONFLICT_KEY = "five66.sync.v2.conflicts";
-  var BOOTSTRAPPED_KEY = "five66.sync.v2.bootstrapped";
   var clientId = "five66_" + Math.random().toString(36).slice(2) + Date.now();
   var cursor = Number(localStorage.getItem(CURSOR_KEY) || "0");
   var knownRevisions = {};
@@ -13,6 +12,9 @@
   var applyingRemote = false;
   var enabled = false;
   var startRetryTimer = null;
+  var flushPromise = null;
+  var pullPromise = null;
+  var inFlightIds = {};
 
   var sources = [
     ["persons", "persons"], ["khasm", "khasmRows"], ["injured", "injured"], ["martyrs", "martyrs"],
@@ -25,10 +27,16 @@
   function notify(message, type) {
     if (typeof window.showToast === "function") window.showToast(message, type || "info");
   }
-  function getQueue() { try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]"); } catch (_) { return []; } }
+  function getQueue() {
+    try {
+      var queue = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+      return Array.isArray(queue) ? queue : [];
+    } catch (_) { return []; }
+  }
   function setQueue(queue) { localStorage.setItem(QUEUE_KEY, JSON.stringify(queue)); }
   function opId() { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (clientId + "_" + Date.now() + "_" + Math.random().toString(36).slice(2)); }
   function collectionItems(variable) { return Array.isArray(window[variable]) ? window[variable] : []; }
+  function revisionKey(collection, recordId) { return collection + ":" + recordId; }
   function recordId(item, collection, index) {
     if (item && item.id !== undefined && item.id !== null) return String(item.id);
     if (item && item._id !== undefined && item._id !== null) return String(item._id);
@@ -49,9 +57,27 @@
     next.meta = { counters: { nextId: window.nextId || 1, payrollNextId: window.payrollNextId || 1 } };
     return next;
   }
+
+  // ندمج التغييرات غير المرسلة على السجل نفسه في عملية واحدة. وهذا يمنع التعارض
+  // الذاتي عند تعديل الحقل أكثر من مرة قبل أن تصل أول دفعة إلى الخادم.
   function enqueue(operation) {
     var queue = getQueue();
-    queue.push(operation);
+    var index = -1;
+    for (var i = queue.length - 1; i >= 0; i--) {
+      var candidate = queue[i];
+      if (candidate.collection === operation.collection && candidate.recordId === operation.recordId && !inFlightIds[candidate.opId]) {
+        index = i;
+        break;
+      }
+    }
+    if (index >= 0) {
+      var previous = queue[index];
+      operation.opId = previous.opId;
+      operation.baseRevision = previous.baseRevision;
+      queue[index] = operation;
+    } else {
+      queue.push(operation);
+    }
     setQueue(queue);
   }
   function queueInitialSnapshot() {
@@ -70,53 +96,85 @@
       var before = snapshots[collection] || {}, after = next[collection] || {};
       Object.keys(after).forEach(function (id) {
         if (JSON.stringify(before[id]) !== JSON.stringify(after[id])) {
-          enqueue({ opId: opId(), collection: collection, recordId: id, type: "upsert", baseRevision: knownRevisions[collection + ":" + id] || 0, payload: after[id] });
+          enqueue({ opId: opId(), collection: collection, recordId: id, type: "upsert", baseRevision: knownRevisions[revisionKey(collection, id)] || 0, payload: after[id] });
         }
       });
       Object.keys(before).forEach(function (id) {
-        if (!after[id]) enqueue({ opId: opId(), collection: collection, recordId: id, type: "delete", baseRevision: knownRevisions[collection + ":" + id] || 0 });
+        if (!Object.prototype.hasOwnProperty.call(after, id)) {
+          enqueue({ opId: opId(), collection: collection, recordId: id, type: "delete", baseRevision: knownRevisions[revisionKey(collection, id)] || 0 });
+        }
       });
     });
     snapshots = next;
   }
   function setRecord(record) {
-    var source = sources.find(function (item) { return item[0] === record.collection; });
+    if (!record || !record.collection || record.id === undefined || record.id === null) return;
     if (record.collection === "meta" && record.id === "counters") {
-      if (record.payload) { window.nextId = record.payload.nextId || window.nextId; window.payrollNextId = record.payload.payrollNextId || window.payrollNextId; }
+      if (record.payload) {
+        window.nextId = record.payload.nextId || window.nextId;
+        window.payrollNextId = record.payload.payrollNextId || window.payrollNextId;
+      }
+      knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
       return;
     }
+    var source = sources.find(function (item) { return item[0] === record.collection; });
     if (!source) return;
     var collection = collectionItems(source[1]);
-    var index = collection.findIndex(function (item, itemIndex) { return recordId(item, record.collection, itemIndex) === record.id; });
-    if (record.deletedAt) { if (index >= 0) collection.splice(index, 1); }
-    else if (index >= 0) collection[index] = clone(record.payload);
-    else collection.push(clone(record.payload));
-    knownRevisions[record.collection + ":" + record.id] = record.revision;
+    var index = collection.findIndex(function (item, itemIndex) { return recordId(item, record.collection, itemIndex) === String(record.id); });
+    if (record.deletedAt) {
+      if (index >= 0) collection.splice(index, 1);
+    } else if (index >= 0) {
+      collection[index] = clone(record.payload);
+    } else {
+      collection.push(clone(record.payload));
+    }
+    knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
   }
   function refreshViews() {
-    if (typeof window.refreshAppData === "function") return window.refreshAppData();
-    ["renderCards", "renderTable", "renderPagination", "renderInjured", "renderMartyrs", "renderHararin", "renderKhasmTable", "buildPayrollTable", "updateStats"].forEach(function (name) {
+    [
+      "renderCards", "renderTable", "renderPagination", "buildTafaqudFilters", "buildTafaqudTable",
+      "buildGhiyabFilters", "buildGhiyabTable", "renderInjured", "renderMartyrs", "renderHararin",
+      "renderKhasmTable", "populateKhasmDropdown", "populateTafaqudDropdown", "populatePayrollFilters",
+      "buildPayrollTable", "renderIstihqaqTable", "updateStats", "updateSectionHeaders", "refreshNotifications"
+    ].forEach(function (name) {
       try { if (typeof window[name] === "function") window[name](); } catch (_) {}
     });
+    try { if (window.Five66Archive && typeof window.Five66Archive.render === "function") window.Five66Archive.render(); } catch (_) {}
   }
   function applyOperations(operations) {
     if (!operations || !operations.length) return;
     applyingRemote = true;
-    operations.forEach(function (operation) { if (operation.record) setRecord(operation.record); });
-    snapshots = takeSnapshot();
-    applyingRemote = false;
+    try {
+      operations.forEach(function (operation) { if (operation.record) setRecord(operation.record); });
+      snapshots = takeSnapshot();
+    } finally {
+      applyingRemote = false;
+    }
     refreshViews();
   }
-  async function pull() {
-    var response = await fetch(BASE + "/bootstrap?since=" + encodeURIComponent(cursor), { cache: "no-store" });
-    if (!response.ok) throw new Error("تعذر جلب تحديثات الخادم");
-    var data = await response.json();
-    applyOperations(data.operations || []);
-    cursor = data.serverSequence || cursor;
-    localStorage.setItem(CURSOR_KEY, String(cursor));
-    if (data.hasMore) return pull();
-    return data;
+
+  async function pullAll() {
+    var lastData = { operations: [], serverSequence: cursor, hasMore: false };
+    do {
+      var previousCursor = cursor;
+      var response = await fetch(BASE + "/bootstrap?since=" + encodeURIComponent(cursor), { cache: "no-store" });
+      if (!response.ok) throw new Error("تعذر جلب تحديثات الخادم");
+      var data = await response.json();
+      applyOperations(data.operations || []);
+      var nextCursor = Number(data.serverSequence);
+      if (Number.isFinite(nextCursor) && nextCursor >= cursor) cursor = nextCursor;
+      localStorage.setItem(CURSOR_KEY, String(cursor));
+      lastData = data;
+      if (data.hasMore && cursor <= previousCursor) throw new Error("تعذر متابعة صفحة المزامنة التالية");
+    } while (lastData.hasMore);
+    return lastData;
   }
+  function pull() {
+    if (pullPromise) return pullPromise;
+    pullPromise = pullAll().finally(function () { pullPromise = null; });
+    return pullPromise;
+  }
+
   function renderConflictBar() {
     var count = getConflicts().length;
     var bar = document.getElementById("sync-v2-conflict-bar");
@@ -138,8 +196,7 @@
   }
   function showConflict() {
     renderConflictBar();
-    var count = getConflicts().length;
-    notify("⚠ توجد " + count + " تعارضات مزامنة. لم تُكتب تعديلاتك فوق بيانات مستخدم آخر.", "error");
+    notify("⚠ توجد " + getConflicts().length + " تعارضات مزامنة. لم تُكتب تعديلاتك فوق بيانات مستخدم آخر.", "error");
   }
   function getConflicts() { try { return JSON.parse(localStorage.getItem(CONFLICT_KEY) || "[]"); } catch (_) { return []; } }
   function saveConflicts(conflicts) { localStorage.setItem(CONFLICT_KEY, JSON.stringify(conflicts)); }
@@ -163,51 +220,74 @@
     renderConflictBar();
     flush().catch(function () {});
   }
-  async function flush() {
-    var queue = getQueue();
-    if (!queue.length) return;
-    var batch = queue.slice(0, 100);
-    var response = await fetch(BASE + "/operations", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ clientId: clientId, operations: batch }) });
-    if (!response.ok) throw new Error("تعذر رفع التعديلات إلى الخادم");
-    var data = await response.json();
-    var acceptedIds = {}, conflictItems = getConflicts();
-    (data.results || []).forEach(function (result) {
-      if (result.status === "accepted") {
-        acceptedIds[result.opId] = true;
-        if (result.record) knownRevisions[result.record.collection + ":" + result.record.id] = result.record.revision;
-      } else if (result.status === "conflict") {
-        acceptedIds[result.opId] = true;
-        conflictItems.push({ opId: result.opId, record: result.record, message: result.message, localOperation: batch.find(function (operation) { return operation.opId === result.opId; }) || null });
+
+  function updateQueuedRevisions(queue, acceptedRecords) {
+    return queue.map(function (operation) {
+      var record = acceptedRecords[revisionKey(operation.collection, operation.recordId)];
+      if (record && !inFlightIds[operation.opId]) {
+        operation.baseRevision = record.revision;
       }
+      return operation;
     });
-    setQueue(queue.filter(function (operation) { return !acceptedIds[operation.opId]; }));
-    saveConflicts(conflictItems.slice(-100));
-    cursor = Math.max(cursor, data.serverSequence || 0);
-    localStorage.setItem(CURSOR_KEY, String(cursor));
-    snapshots = takeSnapshot();
-    if (conflictItems.length) showConflict();
-    if (getQueue().length) return flush();
   }
+  async function flushQueue() {
+    while (true) {
+      var queue = getQueue();
+      if (!queue.length) return;
+      var batch = queue.slice(0, 100);
+      batch.forEach(function (operation) { inFlightIds[operation.opId] = true; });
+      var response;
+      try {
+        response = await fetch(BASE + "/operations", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientId: clientId, operations: batch })
+        });
+        if (!response.ok) throw new Error("تعذر رفع التعديلات إلى الخادم");
+        var data = await response.json();
+        var completedIds = {}, conflictItems = getConflicts(), acceptedRecords = {};
+        (data.results || []).forEach(function (result) {
+          if (result.status === "accepted") {
+            completedIds[result.opId] = true;
+            if (result.record) {
+              knownRevisions[revisionKey(result.record.collection, result.record.id)] = result.record.revision;
+              acceptedRecords[revisionKey(result.record.collection, result.record.id)] = result.record;
+            }
+          } else if (result.status === "conflict") {
+            completedIds[result.opId] = true;
+            conflictItems.push({ opId: result.opId, record: result.record, message: result.message, localOperation: batch.find(function (operation) { return operation.opId === result.opId; }) || null });
+          }
+        });
+        batch.forEach(function (operation) { delete inFlightIds[operation.opId]; });
+        // اقرأ أحدث نسخة من الطابور: قد يكون المستخدم عدّل سجلاً أثناء انتظار الرد.
+        var remaining = getQueue().filter(function (operation) { return !completedIds[operation.opId]; });
+        setQueue(updateQueuedRevisions(remaining, acceptedRecords));
+        saveConflicts(conflictItems.slice(-100));
+        var serverSequence = Number(data.serverSequence);
+        if (Number.isFinite(serverSequence)) cursor = Math.max(cursor, serverSequence);
+        localStorage.setItem(CURSOR_KEY, String(cursor));
+        snapshots = takeSnapshot();
+        if (conflictItems.length) showConflict();
+      } catch (error) {
+        batch.forEach(function (operation) { delete inFlightIds[operation.opId]; });
+        throw error;
+      }
+    }
+  }
+  function flush() {
+    if (flushPromise) return flushPromise;
+    flushPromise = flushQueue().finally(function () { flushPromise = null; });
+    return flushPromise;
+  }
+
   async function start() {
     try {
       if (startRetryTimer) { clearTimeout(startRetryTimer); startRetryTimer = null; }
       var initialBootstrap = await pull();
       enabled = true;
-      // نُرسل لقطة كاملة من بيانات هذا الجهاز عند أول تفعيل له للمزامنة الدقيقة —
-      // بغض النظر عمّا إذا كان عند الخادم بيانات مسبقاً من أجهزة/مستخدمين آخرين.
-      // الاعتماد سابقاً على "serverSequence" فقط كان يعني: أي جهاز يملك تعديلات
-      // محلية غير مُرسَلة بعد (تسجيل دخول جديد، جهاز آخر، أو فترة كان فيها الخادم
-      // متوقفاً) لن تُرسَل تعديلاته إطلاقاً بمجرد أن الخادم يملك أي بيانات من غيره —
-      // إذ كان يُعتبر الحالة المحلية "معروفة ومطابقة سلفاً" دون أي مقارنة فعلية.
-      var alreadyBootstrapped = localStorage.getItem(BOOTSTRAPPED_KEY) === "1";
-      if (!alreadyBootstrapped) {
-        queueInitialSnapshot();
-        localStorage.setItem(BOOTSTRAPPED_KEY, "1");
-      } else {
-        snapshots = takeSnapshot();
-      }
+      if (!Number(initialBootstrap.serverSequence || 0)) queueInitialSnapshot();
+      else snapshots = takeSnapshot();
       var originalSave = window.saveState;
-      window.syncStateToServer = function () { return Promise.resolve(true); };
       window.saveState = function () {
         var result = typeof originalSave === "function" ? originalSave.apply(this, arguments) : undefined;
         setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
@@ -220,11 +300,11 @@
       notify("✓ المزامنة الدقيقة مفعّلة", "success");
     } catch (_) {
       notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي وستُعاد المحاولة تلقائياً.", "error");
-      if (!startRetryTimer) {
-        startRetryTimer = setTimeout(function () { startRetryTimer = null; start(); }, 5000);
-      }
+      if (!startRetryTimer) startRetryTimer = setTimeout(function () { startRetryTimer = null; start(); }, 5000);
     }
   }
+
   window.Five66Sync = { pull: pull, flush: flush, getConflicts: getConflicts, resolveConflict: resolveConflict };
-  if (document.readyState === "complete") setTimeout(start, 500); else window.addEventListener("load", function () { setTimeout(start, 500); });
+  if (document.readyState === "complete") setTimeout(start, 500);
+  else window.addEventListener("load", function () { setTimeout(start, 500); });
 })();
