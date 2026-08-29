@@ -125,14 +125,20 @@ app.get('/api/sync/bootstrap', async (req, res) => {
 });
 
 app.post('/api/sync/operations', async (req, res) => {
+  const opsCount = Array.isArray(req.body?.operations) ? req.body.operations.length : 0;
+  const actor = req.auth?.user || 'server-user';
+  console.log(`📥 POST /api/sync/operations — مستخدم: ${actor} — عدد العمليات: ${opsCount}`);
   try {
     const operations = Array.isArray(req.body?.operations) ? req.body.operations : [];
     if (!operations.length) return res.status(400).json({ ok: false, error: 'مطلوب إرسال عملية مزامنة واحدة على الأقل' });
     if (operations.length > 100) return res.status(413).json({ ok: false, error: 'الحد الأقصى لكل دفعة هو 100 عملية مزامنة' });
-    const result = await syncDb.applyOperations(operations, req.auth?.user || 'server-user');
+    const result = await syncDb.applyOperations(operations, actor);
+    const acceptedCount = (result.results || []).filter((r) => r.status === 'accepted').length;
+    const conflictCount = (result.results || []).filter((r) => r.status === 'conflict').length;
+    console.log(`✅ POST /api/sync/operations نجح — مقبول: ${acceptedCount} — تعارض: ${conflictCount} — الخلفية: ${result.backend}`);
     res.json({ results: result.results, serverSequence: result.serverSequence, backend: result.backend });
   } catch (error) {
-    console.error('POST /api/sync/operations error:', error);
+    console.error('❌ POST /api/sync/operations error:', error);
     const statusCode = error?.statusCode || 500;
     res.status(statusCode).json({ ok: false, error: statusCode === 503 ? 'التخزين الدائم غير متاح مؤقتاً؛ لم تُفقد تعديلاتك وسيعيد التطبيق المحاولة.' : 'تعذر حفظ عمليات المزامنة' });
   }
