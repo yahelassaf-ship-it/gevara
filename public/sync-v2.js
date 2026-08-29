@@ -10,11 +10,12 @@
   var knownRevisions = {};
   var snapshots = {};
   var applyingRemote = false;
-  var enabled = false;
   var startRetryTimer = null;
   var flushPromise = null;
   var pullPromise = null;
   var inFlightIds = {};
+  var eventSource = null;
+  var eventSourceRetryTimer = null;
 
   var sources = [
     ["persons", "persons"], ["khasm", "khasmRows"], ["injured", "injured"], ["martyrs", "martyrs"],
@@ -89,8 +90,16 @@
     });
     snapshots = initial;
   }
+  // ملاحظة إصلاح هامة: كان هذا الفحص يعتمد سابقاً على متغيّر "enabled" الذي لا
+  // يصبح true إلا بعد أول نجاح لطلب bootstrap من الخادم. أي تعديل يقوم به
+  // المستخدم قبل ذلك (تحميل الصفحة بلا اتصال، أو تعطّل الخادم لحظياً) كان
+  // يُحفظ محلياً فقط ولا يدخل طابور المزامنة إطلاقاً — وحين ينجح الاتصال لاحقاً
+  // كان الكود يعيد بناء "الأساس" من الحالة الحالية مباشرة، فتُعتبر تلك التعديلات
+  // متزامنة فعلاً رغم أنها لم تُرسل للخادم قط وتضيع نهائياً دون أي تنبيه. الآن لا
+  // يوجد أي شرط اتصال هنا؛ فقط نتجنب إعادة المعالجة أثناء تطبيق تحديثات قادمة
+  // من الخادم (applyingRemote) حتى لا يعيد التطبيق حفظ ما استلمه للتو كأنه تعديل محلي.
   function queueDifferences() {
-    if (!enabled || applyingRemote) return;
+    if (applyingRemote) return;
     var next = takeSnapshot();
     Object.keys(next).forEach(function (collection) {
       var before = snapshots[collection] || {}, after = next[collection] || {};
@@ -263,12 +272,14 @@
         if (!response.ok) throw new Error("تعذر رفع التعديلات إلى الخادم");
         var data = await response.json();
         var completedIds = {}, conflictItems = getConflicts(), acceptedRecords = {};
+        var acceptedRecordList = [];
         (data.results || []).forEach(function (result) {
           if (result.status === "accepted") {
             completedIds[result.opId] = true;
             if (result.record) {
               knownRevisions[revisionKey(result.record.collection, result.record.id)] = result.record.revision;
               acceptedRecords[revisionKey(result.record.collection, result.record.id)] = result.record;
+              acceptedRecordList.push(result.record);
             }
           } else if (result.status === "conflict") {
             completedIds[result.opId] = true;
@@ -283,6 +294,15 @@
         var serverSequence = Number(data.serverSequence);
         if (Number.isFinite(serverSequence)) cursor = Math.max(cursor, serverSequence);
         localStorage.setItem(CURSOR_KEY, String(cursor));
+        // إصلاح: نطبّق نسخة الخادم المعتمدة فوراً على الحالة المحلية بدل الاكتفاء
+        // بأخذ لقطة من الحالة كما هي. سابقاً إن وصل تحديث من مستخدم آخر لنفس
+        // السجل عبر pull() في اللحظة نفسها، كانت الشاشة قد تُظهر مؤقتاً نسخة
+        // قديمة رغم أن تعديلك وصل وقُبل فعلاً في الخادم.
+        if (acceptedRecordList.length) {
+          applyingRemote = true;
+          try { acceptedRecordList.forEach(setRecord); } finally { applyingRemote = false; }
+          refreshViews();
+        }
         snapshots = takeSnapshot();
         consecutiveFlushFailures = 0;
         lastFlushErrorMessage = null;
@@ -307,26 +327,66 @@
     return flushPromise;
   }
 
+  // ----- مزامنة فورية عبر بث الخادم (SSE) -----
+  // بدل انتظار دورة الاستطلاع كل 5 ثوانٍ، يفتح المتصفح قناة بث واحدة إلى
+  // /api/sync/stream. أي تعديل يقبله الخادم من أي مستخدم يُبث فوراً لكل من
+  // يفتح الصفحة، فتُسحب التغييرات خلال أجزاء من الثانية بدل الانتظار.
+  // الاستطلاع الدوري (setInterval أدناه) يبقى فعالاً كشبكة أمان احتياطية فقط
+  // في حال انقطع اتصال البث لأي سبب (متصفح قديم، بروكسي يحجب SSE، إلخ).
+  function connectStream() {
+    if (typeof window.EventSource !== "function") return; // fallback: الاستطلاع كل 5 ثوانٍ يكفي
+    try {
+      if (eventSource) { eventSource.close(); }
+      eventSource = new EventSource(BASE + "/stream");
+      eventSource.addEventListener("sync", function () {
+        pull().then(flush).catch(function () {});
+      });
+      eventSource.onerror = function () {
+        // EventSource تحاول إعادة الاتصال تلقائياً؛ نضيف محاولة يدوية احتياطية
+        // فقط إذا أُغلقت القناة نهائياً (حالات نادرة خلف بعض البروكسيات).
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+          if (!eventSourceRetryTimer) {
+            eventSourceRetryTimer = setTimeout(function () { eventSourceRetryTimer = null; connectStream(); }, 5000);
+          }
+        }
+      };
+    } catch (_) { /* تجاهل: الاستطلاع الدوري يبقى يعمل كبديل */ }
+  }
+
+  // ----- تثبيت خطّاف الحفظ فوراً عند تحميل الصفحة -----
+  // إصلاح جوهري: سابقاً كان هذا الخطّاف يُركَّب فقط داخل start() بعد نجاح أول
+  // اتصال بالخادم. أي تعديل يقوم به المستخدم قبل ذلك (فتح الصفحة بلا اتصال،
+  // أو كون الخادم معطلاً للحظات عند التحميل) كان يُحفظ محلياً فقط ولا يدخل
+  // طابور المزامنة إطلاقاً، ثم يُعتمد الحفظ المحلي كـ"الأساس" الجديد بمجرد
+  // نجاح الاتصال — فتضيع تلك التعديلات نهائياً دون أي رسالة خطأ.
+  // الآن: نأخذ لقطة من الحالة الحالية (كما حُمّلت من التخزين المحلي) كأساس
+  // للمقارنة، ثم نُركّب الخطّاف فوراً وبشكل متزامن — قبل أي انتظار شبكة. أي
+  // تعديل من هذه اللحظة فصاعداً يدخل الطابور المحفوظ في localStorage نفسه،
+  // بصرف النظر عن حالة الاتصال، وسيُرفع للخادم بمجرد توفره (أو يُكتشف كتعارض
+  // صريح إن تغيّر السجل على الخادم في الأثناء — بدل أن يختفي بصمت).
+  snapshots = takeSnapshot();
+  (function installSaveHook() {
+    var originalSave = window.saveState;
+    window.saveState = function () {
+      var result = typeof originalSave === "function" ? originalSave.apply(this, arguments) : undefined;
+      setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
+      return result;
+    };
+  })();
+
   async function start() {
     try {
       if (startRetryTimer) { clearTimeout(startRetryTimer); startRetryTimer = null; }
       var initialBootstrap = await pull();
-      enabled = true;
       if (!Number(initialBootstrap.serverSequence || 0)) queueInitialSnapshot();
-      else snapshots = takeSnapshot();
-      var originalSave = window.saveState;
-      window.saveState = function () {
-        var result = typeof originalSave === "function" ? originalSave.apply(this, arguments) : undefined;
-        setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
-        return result;
-      };
       if (getQueue().length) await flush();
-      window.addEventListener("online", function () { pull().then(flush).catch(function () {}); });
-      document.addEventListener("visibilitychange", function () { if (!document.hidden) pull().then(flush).catch(function () {}); });
+      connectStream();
+      window.addEventListener("online", function () { pull().then(flush).catch(function () {}); connectStream(); });
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) { pull().then(flush).catch(function () {}); connectStream(); } });
       setInterval(function () { pull().then(flush).catch(function () {}); }, 5000);
-      notify("✓ المزامنة الدقيقة مفعّلة", "success");
+      notify("✓ المزامنة الفورية مفعّلة", "success");
     } catch (_) {
-      notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي وستُعاد المحاولة تلقائياً.", "error");
+      notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي (وتعديلاتك محفوظة في طابور المزامنة محلياً) وستُعاد المحاولة تلقائياً.", "error");
       if (!startRetryTimer) startRetryTimer = setTimeout(function () { startRetryTimer = null; start(); }, 5000);
     }
   }
@@ -335,4 +395,4 @@
   if (document.readyState === "complete") setTimeout(start, 500);
   else window.addEventListener("load", function () { setTimeout(start, 500); });
 })();
-                                
+                                    
