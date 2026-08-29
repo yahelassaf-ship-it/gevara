@@ -198,6 +198,23 @@
     renderConflictBar();
     notify("⚠ توجد " + getConflicts().length + " تعارضات مزامنة. لم تُكتب تعديلاتك فوق بيانات مستخدم آخر.", "error");
   }
+
+  // شارة دائمة تُظهر بوضوح لو فيه تعديلات محفوظة محلياً فقط ولم تصل للسيرفر بعد
+  // (فشل رفع متكرر). بدون هذه الشارة كان الفشل الصامت يخفي المشكلة تماماً عن المستخدم.
+  var consecutiveFlushFailures = 0;
+  var lastFlushErrorMessage = null;
+  function renderPendingSyncBar() {
+    var pendingCount = getQueue().length;
+    var bar = document.getElementById("sync-v2-pending-bar");
+    if (!pendingCount || consecutiveFlushFailures < 2) { if (bar) bar.remove(); return; }
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "sync-v2-pending-bar";
+      bar.style.cssText = "position:fixed;left:12px;right:12px;bottom:64px;z-index:999997;background:#7a4a10;color:#fff8dc;border:1px solid #e9c76a;border-radius:14px;padding:10px 14px;font:700 12.5px Cairo,Tajawal,sans-serif;direction:rtl;box-shadow:0 5px 18px rgba(0,0,0,.35)";
+      document.body.appendChild(bar);
+    }
+    bar.textContent = "⚠ " + pendingCount + " تعديل(ات) محفوظة على هذا الجهاز فقط ولم تصل للسيرفر بعد" + (lastFlushErrorMessage ? " — " + lastFlushErrorMessage : "");
+  }
   function getConflicts() { try { return JSON.parse(localStorage.getItem(CONFLICT_KEY) || "[]"); } catch (_) { return []; } }
   function saveConflicts(conflicts) { localStorage.setItem(CONFLICT_KEY, JSON.stringify(conflicts)); }
   function resolveConflict(conflictOpId, choice) {
@@ -267,9 +284,19 @@
         if (Number.isFinite(serverSequence)) cursor = Math.max(cursor, serverSequence);
         localStorage.setItem(CURSOR_KEY, String(cursor));
         snapshots = takeSnapshot();
+        consecutiveFlushFailures = 0;
+        lastFlushErrorMessage = null;
+        renderPendingSyncBar();
         if (conflictItems.length) showConflict();
       } catch (error) {
         batch.forEach(function (operation) { delete inFlightIds[operation.opId]; });
+        consecutiveFlushFailures += 1;
+        lastFlushErrorMessage = (error && error.message) ? error.message : "خطأ اتصال";
+        console.error("[sync-v2] فشل رفع التعديلات:", error);
+        renderPendingSyncBar();
+        if (consecutiveFlushFailures === 2 || consecutiveFlushFailures % 12 === 0) {
+          notify("⚠ تعذر رفع " + getQueue().length + " تعديل(ات) للسيرفر. سيُعاد المحاولة تلقائياً — تحقق من الاتصال.", "error");
+        }
         throw error;
       }
     }
@@ -308,3 +335,4 @@
   if (document.readyState === "complete") setTimeout(start, 500);
   else window.addEventListener("load", function () { setTimeout(start, 500); });
 })();
+                                
