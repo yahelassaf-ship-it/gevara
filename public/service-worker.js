@@ -4,7 +4,7 @@
 // بحيث يفتح التطبيق فوراً حتى بدون إنترنت.
 // بيانات API تبقى دائماً Network-only لأن منطق المزامنة الدقيقة يدير طابوره في الواجهة.
 
-const CACHE_NAME = 'diwan-shell-v5';
+const CACHE_NAME = 'diwan-shell-v6';
 const SHELL_URLS = ['/'];
 
 self.addEventListener('install', (event) => {

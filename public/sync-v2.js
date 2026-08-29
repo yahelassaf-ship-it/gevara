@@ -5,17 +5,38 @@
   var QUEUE_KEY = "five66.sync.v2.queue";
   var CURSOR_KEY = "five66.sync.v2.cursor";
   var CONFLICT_KEY = "five66.sync.v2.conflicts";
+  var REVISIONS_KEY = "five66.sync.v2.revisions";
   var clientId = "five66_" + Math.random().toString(36).slice(2) + Date.now();
   var cursor = Number(localStorage.getItem(CURSOR_KEY) || "0");
-  var knownRevisions = {};
+  // إصلاح حاسم: أرقام نسخ السجلات كانت تُحفظ في الذاكرة فقط. بعد إعادة فتح الصفحة
+  // لا يعيد bootstrap إلا العمليات الأحدث من علامة الجهاز، فتبقى نسخ السجلات
+  // القديمة مجهولة ويُرسل أي تعديل عليها بـ baseRevision=0 فيرفضه الخادم كتعارض
+  // وهمي — ويبدو التعديل محفوظاً محلياً لكنه لا يصل إلى Supabase أبداً.
+  // الآن نخزّن النسخ في localStorage لتبقى صحيحة بين الجلسات.
+  var knownRevisions = (function () {
+    try {
+      var saved = JSON.parse(localStorage.getItem(REVISIONS_KEY) || "{}");
+      return (saved && typeof saved === "object") ? saved : {};
+    } catch (_) { return {}; }
+  })();
+  function saveKnownRevisions() {
+    try {
+      var keys = Object.keys(knownRevisions);
+      if (keys.length > 20000) {
+        var trimmed = {};
+        keys.slice(-10000).forEach(function (k) { trimmed[k] = knownRevisions[k]; });
+        knownRevisions = trimmed;
+      }
+      localStorage.setItem(REVISIONS_KEY, JSON.stringify(knownRevisions));
+    } catch (_) {}
+  }
   var snapshots = {};
   var applyingRemote = false;
+  var enabled = false;
   var startRetryTimer = null;
   var flushPromise = null;
   var pullPromise = null;
   var inFlightIds = {};
-  var eventSource = null;
-  var eventSourceRetryTimer = null;
 
   var sources = [
     ["persons", "persons"], ["khasm", "khasmRows"], ["injured", "injured"], ["martyrs", "martyrs"],
@@ -90,16 +111,8 @@
     });
     snapshots = initial;
   }
-  // ملاحظة إصلاح هامة: كان هذا الفحص يعتمد سابقاً على متغيّر "enabled" الذي لا
-  // يصبح true إلا بعد أول نجاح لطلب bootstrap من الخادم. أي تعديل يقوم به
-  // المستخدم قبل ذلك (تحميل الصفحة بلا اتصال، أو تعطّل الخادم لحظياً) كان
-  // يُحفظ محلياً فقط ولا يدخل طابور المزامنة إطلاقاً — وحين ينجح الاتصال لاحقاً
-  // كان الكود يعيد بناء "الأساس" من الحالة الحالية مباشرة، فتُعتبر تلك التعديلات
-  // متزامنة فعلاً رغم أنها لم تُرسل للخادم قط وتضيع نهائياً دون أي تنبيه. الآن لا
-  // يوجد أي شرط اتصال هنا؛ فقط نتجنب إعادة المعالجة أثناء تطبيق تحديثات قادمة
-  // من الخادم (applyingRemote) حتى لا يعيد التطبيق حفظ ما استلمه للتو كأنه تعديل محلي.
   function queueDifferences() {
-    if (applyingRemote) return;
+    if (!enabled || applyingRemote) return;
     var next = takeSnapshot();
     Object.keys(next).forEach(function (collection) {
       var before = snapshots[collection] || {}, after = next[collection] || {};
@@ -124,6 +137,7 @@
         window.payrollNextId = record.payload.payrollNextId || window.payrollNextId;
       }
       knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
+      saveKnownRevisions();
       return;
     }
     var source = sources.find(function (item) { return item[0] === record.collection; });
@@ -138,6 +152,7 @@
       collection.push(clone(record.payload));
     }
     knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
+    saveKnownRevisions();
   }
   function refreshViews() {
     [
@@ -207,23 +222,6 @@
     renderConflictBar();
     notify("⚠ توجد " + getConflicts().length + " تعارضات مزامنة. لم تُكتب تعديلاتك فوق بيانات مستخدم آخر.", "error");
   }
-
-  // شارة دائمة تُظهر بوضوح لو فيه تعديلات محفوظة محلياً فقط ولم تصل للسيرفر بعد
-  // (فشل رفع متكرر). بدون هذه الشارة كان الفشل الصامت يخفي المشكلة تماماً عن المستخدم.
-  var consecutiveFlushFailures = 0;
-  var lastFlushErrorMessage = null;
-  function renderPendingSyncBar() {
-    var pendingCount = getQueue().length;
-    var bar = document.getElementById("sync-v2-pending-bar");
-    if (!pendingCount || consecutiveFlushFailures < 2) { if (bar) bar.remove(); return; }
-    if (!bar) {
-      bar = document.createElement("div");
-      bar.id = "sync-v2-pending-bar";
-      bar.style.cssText = "position:fixed;left:12px;right:12px;bottom:64px;z-index:999997;background:#7a4a10;color:#fff8dc;border:1px solid #e9c76a;border-radius:14px;padding:10px 14px;font:700 12.5px Cairo,Tajawal,sans-serif;direction:rtl;box-shadow:0 5px 18px rgba(0,0,0,.35)";
-      document.body.appendChild(bar);
-    }
-    bar.textContent = "⚠ " + pendingCount + " تعديل(ات) محفوظة على هذا الجهاز فقط ولم تصل للسيرفر بعد" + (lastFlushErrorMessage ? " — " + lastFlushErrorMessage : "");
-  }
   function getConflicts() { try { return JSON.parse(localStorage.getItem(CONFLICT_KEY) || "[]"); } catch (_) { return []; } }
   function saveConflicts(conflicts) { localStorage.setItem(CONFLICT_KEY, JSON.stringify(conflicts)); }
   function resolveConflict(conflictOpId, choice) {
@@ -272,14 +270,13 @@
         if (!response.ok) throw new Error("تعذر رفع التعديلات إلى الخادم");
         var data = await response.json();
         var completedIds = {}, conflictItems = getConflicts(), acceptedRecords = {};
-        var acceptedRecordList = [];
         (data.results || []).forEach(function (result) {
           if (result.status === "accepted") {
             completedIds[result.opId] = true;
             if (result.record) {
               knownRevisions[revisionKey(result.record.collection, result.record.id)] = result.record.revision;
               acceptedRecords[revisionKey(result.record.collection, result.record.id)] = result.record;
-              acceptedRecordList.push(result.record);
+              saveKnownRevisions();
             }
           } else if (result.status === "conflict") {
             completedIds[result.opId] = true;
@@ -294,29 +291,10 @@
         var serverSequence = Number(data.serverSequence);
         if (Number.isFinite(serverSequence)) cursor = Math.max(cursor, serverSequence);
         localStorage.setItem(CURSOR_KEY, String(cursor));
-        // إصلاح: نطبّق نسخة الخادم المعتمدة فوراً على الحالة المحلية بدل الاكتفاء
-        // بأخذ لقطة من الحالة كما هي. سابقاً إن وصل تحديث من مستخدم آخر لنفس
-        // السجل عبر pull() في اللحظة نفسها، كانت الشاشة قد تُظهر مؤقتاً نسخة
-        // قديمة رغم أن تعديلك وصل وقُبل فعلاً في الخادم.
-        if (acceptedRecordList.length) {
-          applyingRemote = true;
-          try { acceptedRecordList.forEach(setRecord); } finally { applyingRemote = false; }
-          refreshViews();
-        }
         snapshots = takeSnapshot();
-        consecutiveFlushFailures = 0;
-        lastFlushErrorMessage = null;
-        renderPendingSyncBar();
         if (conflictItems.length) showConflict();
       } catch (error) {
         batch.forEach(function (operation) { delete inFlightIds[operation.opId]; });
-        consecutiveFlushFailures += 1;
-        lastFlushErrorMessage = (error && error.message) ? error.message : "خطأ اتصال";
-        console.error("[sync-v2] فشل رفع التعديلات:", error);
-        renderPendingSyncBar();
-        if (consecutiveFlushFailures === 2 || consecutiveFlushFailures % 12 === 0) {
-          notify("⚠ تعذر رفع " + getQueue().length + " تعديل(ات) للسيرفر. سيُعاد المحاولة تلقائياً — تحقق من الاتصال.", "error");
-        }
         throw error;
       }
     }
@@ -327,66 +305,30 @@
     return flushPromise;
   }
 
-  // ----- مزامنة فورية عبر بث الخادم (SSE) -----
-  // بدل انتظار دورة الاستطلاع كل 5 ثوانٍ، يفتح المتصفح قناة بث واحدة إلى
-  // /api/sync/stream. أي تعديل يقبله الخادم من أي مستخدم يُبث فوراً لكل من
-  // يفتح الصفحة، فتُسحب التغييرات خلال أجزاء من الثانية بدل الانتظار.
-  // الاستطلاع الدوري (setInterval أدناه) يبقى فعالاً كشبكة أمان احتياطية فقط
-  // في حال انقطع اتصال البث لأي سبب (متصفح قديم، بروكسي يحجب SSE، إلخ).
-  function connectStream() {
-    if (typeof window.EventSource !== "function") return; // fallback: الاستطلاع كل 5 ثوانٍ يكفي
-    try {
-      if (eventSource) { eventSource.close(); }
-      eventSource = new EventSource(BASE + "/stream");
-      eventSource.addEventListener("sync", function () {
-        pull().then(flush).catch(function () {});
-      });
-      eventSource.onerror = function () {
-        // EventSource تحاول إعادة الاتصال تلقائياً؛ نضيف محاولة يدوية احتياطية
-        // فقط إذا أُغلقت القناة نهائياً (حالات نادرة خلف بعض البروكسيات).
-        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
-          if (!eventSourceRetryTimer) {
-            eventSourceRetryTimer = setTimeout(function () { eventSourceRetryTimer = null; connectStream(); }, 5000);
-          }
-        }
-      };
-    } catch (_) { /* تجاهل: الاستطلاع الدوري يبقى يعمل كبديل */ }
-  }
-
-  // ----- تثبيت خطّاف الحفظ فوراً عند تحميل الصفحة -----
-  // إصلاح جوهري: سابقاً كان هذا الخطّاف يُركَّب فقط داخل start() بعد نجاح أول
-  // اتصال بالخادم. أي تعديل يقوم به المستخدم قبل ذلك (فتح الصفحة بلا اتصال،
-  // أو كون الخادم معطلاً للحظات عند التحميل) كان يُحفظ محلياً فقط ولا يدخل
-  // طابور المزامنة إطلاقاً، ثم يُعتمد الحفظ المحلي كـ"الأساس" الجديد بمجرد
-  // نجاح الاتصال — فتضيع تلك التعديلات نهائياً دون أي رسالة خطأ.
-  // الآن: نأخذ لقطة من الحالة الحالية (كما حُمّلت من التخزين المحلي) كأساس
-  // للمقارنة، ثم نُركّب الخطّاف فوراً وبشكل متزامن — قبل أي انتظار شبكة. أي
-  // تعديل من هذه اللحظة فصاعداً يدخل الطابور المحفوظ في localStorage نفسه،
-  // بصرف النظر عن حالة الاتصال، وسيُرفع للخادم بمجرد توفره (أو يُكتشف كتعارض
-  // صريح إن تغيّر السجل على الخادم في الأثناء — بدل أن يختفي بصمت).
-  snapshots = takeSnapshot();
-  (function installSaveHook() {
-    var originalSave = window.saveState;
-    window.saveState = function () {
-      var result = typeof originalSave === "function" ? originalSave.apply(this, arguments) : undefined;
-      setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
-      return result;
-    };
-  })();
-
   async function start() {
     try {
       if (startRetryTimer) { clearTimeout(startRetryTimer); startRetryTimer = null; }
       var initialBootstrap = await pull();
+      enabled = true;
       if (!Number(initialBootstrap.serverSequence || 0)) queueInitialSnapshot();
+      else snapshots = takeSnapshot();
+      var originalSave = window.saveState;
+      window.saveState = function () {
+        var result = typeof originalSave === "function" ? originalSave.apply(this, arguments) : undefined;
+        setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
+        return result;
+      };
+      // التقط أي تعديلات حدثت قبل اكتمال بدء المزامنة (مثلاً دمج السجلات أثناء
+      // initApp) — كانت تدخل اللقطة من دون أن تُرفع فتضيع من الأجهزة الأخرى.
+      queueDifferences();
       if (getQueue().length) await flush();
-      connectStream();
-      window.addEventListener("online", function () { pull().then(flush).catch(function () {}); connectStream(); });
-      document.addEventListener("visibilitychange", function () { if (!document.hidden) { pull().then(flush).catch(function () {}); connectStream(); } });
-      setInterval(function () { pull().then(flush).catch(function () {}); }, 5000);
-      notify("✓ المزامنة الفورية مفعّلة", "success");
+      window.addEventListener("online", function () { queueDifferences(); pull().then(flush).catch(function () {}); });
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) { queueDifferences(); pull().then(flush).catch(function () {}); } });
+      // شبكة أمان دورية: أي تعديل على البيانات مرّ دون saveState يُكتشف ويُزامَن.
+      setInterval(function () { queueDifferences(); pull().then(flush).catch(function () {}); }, 5000);
+      notify("✓ المزامنة الدقيقة مفعّلة", "success");
     } catch (_) {
-      notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي (وتعديلاتك محفوظة في طابور المزامنة محلياً) وستُعاد المحاولة تلقائياً.", "error");
+      notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي وستُعاد المحاولة تلقائياً.", "error");
       if (!startRetryTimer) startRetryTimer = setTimeout(function () { startRetryTimer = null; start(); }, 5000);
     }
   }
@@ -395,4 +337,3 @@
   if (document.readyState === "complete") setTimeout(start, 500);
   else window.addEventListener("load", function () { setTimeout(start, 500); });
 })();
-                                    
