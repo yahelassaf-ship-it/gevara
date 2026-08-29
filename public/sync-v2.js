@@ -348,9 +348,11 @@
         return result;
       };
       if (getQueue().length) await flush();
-      window.addEventListener("online", function () { pull().then(flush).catch(function () {}); });
-      document.addEventListener("visibilitychange", function () { if (!document.hidden) pull().then(flush).catch(function () {}); });
-      setInterval(function () { pull().then(flush).catch(function () {}); }, 5000);
+      window.addEventListener("online", function () { connectStream(); pull().then(flush).catch(function () {}); });
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) { connectStream(); pull().then(flush).catch(function () {}); } });
+      connectStream();
+      // شبكة أمان: تغطي حالات فقدان البث (خادم أعيد تشغيله، وسيط شبكة يقطع SSE...).
+      setInterval(function () { pull().then(flush).catch(function () {}); }, 20000);
       tabHeartbeat();
       setInterval(tabHeartbeat, 2000);
       notify("✓ المزامنة الدقيقة مفعّلة", "success");
@@ -358,6 +360,25 @@
       notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي وستُعاد المحاولة تلقائياً.", "error");
       if (!startRetryTimer) startRetryTimer = setTimeout(function () { startRetryTimer = null; start(); }, 5000);
     }
+  }
+
+  // ===================== بث فوري (SSE) =====================
+  // يبلّغنا الخادم لحظة قبول أي تعديل من أي جهاز آخر، فنجلبه فوراً بدل
+  // انتظار دورة الاستطلاع. إن انقطع الاتصال (نوم الجهاز، شبكة ضعيفة...)
+  // يعيد المتصفح المحاولة تلقائياً، ودورة الاستطلاع الدورية تبقى شبكة أمان.
+  var streamSource = null;
+  var streamRetryTimer = null;
+  function connectStream() {
+    if (typeof window.EventSource !== "function") return;
+    try {
+      if (streamSource) streamSource.close();
+      streamSource = new EventSource(BASE + "/stream");
+      streamSource.onmessage = function () { pull().then(flush).catch(function () {}); };
+      streamSource.onerror = function () {
+        if (streamSource) { streamSource.close(); streamSource = null; }
+        if (!streamRetryTimer) streamRetryTimer = setTimeout(function () { streamRetryTimer = null; connectStream(); }, 4000);
+      };
+    } catch (_) {}
   }
 
   window.Five66Sync = { pull: pull, flush: flush, getConflicts: getConflicts, resolveConflict: resolveConflict };
