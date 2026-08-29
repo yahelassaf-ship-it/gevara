@@ -20004,6 +20004,28 @@ function showImportResults(results, fileName, selectedColumn) {
     document.addEventListener('DOMContentLoaded', function () { window.Five66Archive.render(); });
   }
 </script>
+<script>
+// جسر للمزامنة: المتغيرات أعلاه معرّفة بـ let/const، وهذه لا تصبح خصائص
+// على window تلقائياً (بعكس var) — لذلك كان sync-v2.js يقرأ window.persons
+// وأمثالها فيجدها دائماً غير موجودة، فلا يرسل بيانات الأفراد والسجلات إطلاقاً.
+// الحل: كائن بخصائص getter تُعيد قيمة المتغير الحيّ في كل قراءة (حتى بعد
+// إعادة تعيينه بالكامل، كما يحدث مثلاً في loadState() عبر persons.filter()).
+window.Five66State = {
+  get persons() { return persons; },
+  get khasmRows() { return khasmRows; },
+  get injured() { return injured; },
+  get martyrs() { return martyrs; },
+  get hararin() { return hararin; },
+  get tafaqudArchive() { return tafaqudArchive; },
+  get ghiyabArchive() { return ghiyabArchive; },
+  get personEvents() { return personEvents; },
+  get payrollRecords() { return payrollRecords; },
+  get payrollHeaders() { return payrollHeaders; },
+  get operationalArchiveDocuments() { return operationalArchiveDocuments; },
+  get nextId() { return nextId; },
+  get payrollNextId() { return payrollNextId; }
+};
+</script>
 <script src="/sync-v2.js"></script>
 </body>
 </html>
