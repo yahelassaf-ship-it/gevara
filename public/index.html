@@ -13841,24 +13841,14 @@ async function loadShamCashPhotos() {
 }
 
 async function loadState() {
-  var serverState = null;
+  // ⚠️ هذه الدالة لم تعد تجلب /api/state (لقطة الحالة الكاملة القديمة) إطلاقاً.
+  // ذلك المسار أصبح مجمَّداً منذ التحول إلى مزامنة العمليات الدقيقة عبر
+  // sync-v2.js: لا شيء يكتب إليه بعد الآن، فكان يعيد بيانات قديمة جامدة في كل
+  // تحميل للصفحة ويكتب فوق تعديلات حديثة تمت مزامنتها فعلياً — وهذا بالضبط
+  // كان يسبب رجوع القيم القديمة بعد تحديث الصفحة. المصدر المعتمد الوحيد الآن
+  // هو bootstrap عبر Five66Sync.pull() الذي يعمل مباشرة بعد initApp().
   var pendingState = _getPendingSyncState();
-  try {
-    var r = await fetch(_SYNC_URL, {cache:'no-store'});
-    if(r.ok) {
-      serverState = await r.json();
-    }
-  } catch(e){ console.warn('loadState fetch:', e); }
-
-  var effectiveState = serverState || {};
-  var serverUpdatedAt = serverState && serverState._updatedAt ? Date.parse(serverState._updatedAt) || 0 : 0;
-  var pendingAt = _getPendingSyncAt();
-  if(pendingState && (!serverUpdatedAt || pendingAt >= serverUpdatedAt)) {
-    effectiveState = Object.assign({}, serverState || {}, pendingState);
-  } else if(pendingState && serverUpdatedAt && pendingAt < serverUpdatedAt) {
-    _clearPendingSyncState();
-    pendingState = null;
-  }
+  var effectiveState = pendingState ? Object.assign({}, pendingState) : {};
   for(var sk in effectiveState){ if(effectiveState[sk]!=null) _ls.set(sk, effectiveState[sk]); }
 
   function _get(key){ return (effectiveState && effectiveState[key]!=null) ? effectiveState[key] : _ls.get(key); }
