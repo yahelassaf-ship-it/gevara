@@ -9,8 +9,16 @@ const http = require('http');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const basicAuth = require('express-basic-auth');
+const { EventEmitter } = require('events');
 const db = require('./db');
 const syncDb = require('./sync-db');
+
+// ----- بث فوري (SSE) -----
+// ناقل أحداث داخلي بسيط داخل عملية Node نفسها: عند قبول أي عملية مزامنة، تُبث
+// إشارة لكل قنوات /api/sync/stream المفتوحة حالياً، فتسحب كل الأجهزة الأخرى
+// التحديث خلال أجزاء من الثانية بدل انتظار دورة الاستطلاع كل 5 ثوانٍ.
+const syncBus = new EventEmitter();
+syncBus.setMaxListeners(0);
 
 const PORT = process.env.PORT || 3000;
 
@@ -136,12 +144,43 @@ app.post('/api/sync/operations', async (req, res) => {
     const acceptedCount = (result.results || []).filter((r) => r.status === 'accepted').length;
     const conflictCount = (result.results || []).filter((r) => r.status === 'conflict').length;
     console.log(`✅ POST /api/sync/operations نجح — مقبول: ${acceptedCount} — تعارض: ${conflictCount} — الخلفية: ${result.backend}`);
+    // أبلغ كل من يفتح الصفحة الآن أن هناك تحديثاً جديداً، فتسحبه واجهته فوراً
+    // عبر /api/sync/stream بدل الانتظار حتى دورة الاستطلاع الدورية التالية.
+    if (acceptedCount > 0) {
+      syncBus.emit('changed', { serverSequence: result.serverSequence, actor });
+    }
     res.json({ results: result.results, serverSequence: result.serverSequence, backend: result.backend });
   } catch (error) {
     console.error('❌ POST /api/sync/operations error:', error);
     const statusCode = error?.statusCode || 500;
     res.status(statusCode).json({ ok: false, error: statusCode === 503 ? 'التخزين الدائم غير متاح مؤقتاً؛ لم تُفقد تعديلاتك وسيعيد التطبيق المحاولة.' : 'تعذر حفظ عمليات المزامنة' });
   }
+});
+
+// قناة بث لحظي (Server-Sent Events): محمية بنفس Basic Auth العام على التطبيق
+// (وليست قناة مفتوحة بلا حماية كما كانت قناة Socket.io القديمة التي أُزيلت).
+// كل عميل متصل يستقبل إشارة "sync" فور قبول أي تعديل من أي مستخدم آخر.
+app.get('/api/sync/stream', (req, res) => {
+  req.socket.setTimeout(0);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'
+  });
+  res.write('retry: 3000\n\n');
+  const onChanged = (payload) => {
+    try { res.write(`event: sync\ndata: ${JSON.stringify(payload)}\n\n`); } catch (_) {}
+  };
+  syncBus.on('changed', onChanged);
+  // نبضة دورية لمنع أي بروكسي/منصة استضافة (مثل Railway) من قطع الاتصال الخامل.
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (_) {}
+  }, 20000);
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    syncBus.off('changed', onChanged);
+  });
 });
 
 // حالة الاتصال بـ Supabase (متاحة لكل من admin و viewer) — للتأكد قبل إعادة
