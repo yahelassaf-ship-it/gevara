@@ -5,31 +5,9 @@
   var QUEUE_KEY = "five66.sync.v2.queue";
   var CURSOR_KEY = "five66.sync.v2.cursor";
   var CONFLICT_KEY = "five66.sync.v2.conflicts";
-  var REVISIONS_KEY = "five66.sync.v2.revisions";
   var clientId = "five66_" + Math.random().toString(36).slice(2) + Date.now();
   var cursor = Number(localStorage.getItem(CURSOR_KEY) || "0");
-  // إصلاح حاسم: أرقام نسخ السجلات كانت تُحفظ في الذاكرة فقط. بعد إعادة فتح الصفحة
-  // لا يعيد bootstrap إلا العمليات الأحدث من علامة الجهاز، فتبقى نسخ السجلات
-  // القديمة مجهولة ويُرسل أي تعديل عليها بـ baseRevision=0 فيرفضه الخادم كتعارض
-  // وهمي — ويبدو التعديل محفوظاً محلياً لكنه لا يصل إلى Supabase أبداً.
-  // الآن نخزّن النسخ في localStorage لتبقى صحيحة بين الجلسات.
-  var knownRevisions = (function () {
-    try {
-      var saved = JSON.parse(localStorage.getItem(REVISIONS_KEY) || "{}");
-      return (saved && typeof saved === "object") ? saved : {};
-    } catch (_) { return {}; }
-  })();
-  function saveKnownRevisions() {
-    try {
-      var keys = Object.keys(knownRevisions);
-      if (keys.length > 20000) {
-        var trimmed = {};
-        keys.slice(-10000).forEach(function (k) { trimmed[k] = knownRevisions[k]; });
-        knownRevisions = trimmed;
-      }
-      localStorage.setItem(REVISIONS_KEY, JSON.stringify(knownRevisions));
-    } catch (_) {}
-  }
+  var knownRevisions = {};
   var snapshots = {};
   var applyingRemote = false;
   var enabled = false;
@@ -37,6 +15,54 @@
   var flushPromise = null;
   var pullPromise = null;
   var inFlightIds = {};
+
+  // ===================== حارس التبويبات المتعددة =====================
+  // فتح أكثر من تبويب/نافذة لنفس التطبيق بنفس الوقت غير آمن مع طابور المزامنة
+  // الحالي (كل تبويب له نسخة منفصلة بالذاكرة، ويتشاركون نفس مكان الحفظ
+  // بالمتصفح — فآخر تبويب يكتب يمحي تعديل التبويب الآخر قبل ما يوصل للسيرفر).
+  // هالحارس يكتشف أي تبويب إضافي فوراً ويعرض تحذير واضح للمستخدم لإغلاقه.
+  var TABS_KEY = "five66.sync.v2.tabs";
+  var TAB_STALE_MS = 6000;
+  function _readTabs() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(TABS_KEY) || "{}");
+      return (raw && typeof raw === "object") ? raw : {};
+    } catch (_) { return {}; }
+  }
+  function _writeTabs(tabs) { try { localStorage.setItem(TABS_KEY, JSON.stringify(tabs)); } catch (_) {} }
+  function _pruneTabs(tabs) {
+    var now = Date.now();
+    Object.keys(tabs).forEach(function (id) {
+      if (!tabs[id] || (now - tabs[id]) > TAB_STALE_MS) delete tabs[id];
+    });
+    return tabs;
+  }
+  function renderMultiTabWarning(count) {
+    var bar = document.getElementById("sync-v2-multitab-bar");
+    if (count <= 1) { if (bar) bar.remove(); return; }
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "sync-v2-multitab-bar";
+      bar.style.cssText = "position:fixed;left:12px;right:12px;top:12px;z-index:999999;background:#8b1a1a;color:#fff8dc;border:2px solid #e9c76a;border-radius:14px;padding:12px 16px;font:700 13px Cairo,Tajawal,sans-serif;direction:rtl;box-shadow:0 5px 18px rgba(0,0,0,.35);text-align:center";
+      if (document.body) document.body.appendChild(bar);
+    }
+    bar.textContent = "⚠ التطبيق مفتوح بأكثر من تبويب/نافذة بنفس الوقت (" + count + "). أغلقي كل التبويبات الإضافية فوراً وابقي على واحد فقط، وإلا قد تُفقد تعديلاتك.";
+  }
+  function tabHeartbeat() {
+    var tabs = _pruneTabs(_readTabs());
+    tabs[clientId] = Date.now();
+    _writeTabs(tabs);
+    renderMultiTabWarning(Object.keys(tabs).length);
+  }
+  function removeOwnTab() {
+    try {
+      var tabs = _readTabs();
+      delete tabs[clientId];
+      _writeTabs(tabs);
+    } catch (_) {}
+  }
+  window.addEventListener("pagehide", removeOwnTab);
+  window.addEventListener("beforeunload", removeOwnTab);
 
   var sources = [
     ["persons", "persons"], ["khasm", "khasmRows"], ["injured", "injured"], ["martyrs", "martyrs"],
@@ -137,7 +163,6 @@
         window.payrollNextId = record.payload.payrollNextId || window.payrollNextId;
       }
       knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
-      saveKnownRevisions();
       return;
     }
     var source = sources.find(function (item) { return item[0] === record.collection; });
@@ -152,7 +177,6 @@
       collection.push(clone(record.payload));
     }
     knownRevisions[revisionKey(record.collection, record.id)] = record.revision;
-    saveKnownRevisions();
   }
   function refreshViews() {
     [
@@ -276,7 +300,6 @@
             if (result.record) {
               knownRevisions[revisionKey(result.record.collection, result.record.id)] = result.record.revision;
               acceptedRecords[revisionKey(result.record.collection, result.record.id)] = result.record;
-              saveKnownRevisions();
             }
           } else if (result.status === "conflict") {
             completedIds[result.opId] = true;
@@ -318,14 +341,12 @@
         setTimeout(function () { queueDifferences(); flush().catch(function () {}); }, 0);
         return result;
       };
-      // التقط أي تعديلات حدثت قبل اكتمال بدء المزامنة (مثلاً دمج السجلات أثناء
-      // initApp) — كانت تدخل اللقطة من دون أن تُرفع فتضيع من الأجهزة الأخرى.
-      queueDifferences();
       if (getQueue().length) await flush();
-      window.addEventListener("online", function () { queueDifferences(); pull().then(flush).catch(function () {}); });
-      document.addEventListener("visibilitychange", function () { if (!document.hidden) { queueDifferences(); pull().then(flush).catch(function () {}); } });
-      // شبكة أمان دورية: أي تعديل على البيانات مرّ دون saveState يُكتشف ويُزامَن.
-      setInterval(function () { queueDifferences(); pull().then(flush).catch(function () {}); }, 5000);
+      window.addEventListener("online", function () { pull().then(flush).catch(function () {}); });
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) pull().then(flush).catch(function () {}); });
+      setInterval(function () { pull().then(flush).catch(function () {}); }, 5000);
+      tabHeartbeat();
+      setInterval(tabHeartbeat, 2000);
       notify("✓ المزامنة الدقيقة مفعّلة", "success");
     } catch (_) {
       notify("⚠ التخزين الدائم غير متاح مؤقتاً؛ سيستمر الحفظ المحلي وستُعاد المحاولة تلقائياً.", "error");
